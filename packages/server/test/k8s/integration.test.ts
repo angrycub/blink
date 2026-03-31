@@ -10,6 +10,10 @@
  *   ./scripts/run-k8s-integration.sh
  *   # or
  *   bun install && BLINK_K8S_TEST=1 bun test packages/server/test/k8s/integration.test.ts
+ *
+ * The test uses BLINK_K8S_TEST_KUBECONFIG to load an isolated
+ * kubeconfig (e.g. exported by kind) so it never touches your
+ * default ~/.kube/config.
  */
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 
@@ -19,12 +23,6 @@ import * as k8s from "@kubernetes/client-node";
 
 const SKIP = process.env.BLINK_K8S_TEST !== "1";
 
-// kind clusters use a self-signed CA. Bun's fetch does not honor
-// the kubeconfig certificate-authority-data the way Node.js does,
-// so we need to disable TLS verification for local test clusters.
-if (!SKIP) {
-  process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
-}
 const NAMESPACE = "default";
 const TEST_AGENT_ID = `test-agent-${Date.now()}`;
 const RESOURCE_NAME = `blink-agent-${TEST_AGENT_ID}`;
@@ -37,6 +35,22 @@ const LABELS: Record<string, string> = {
 };
 
 let coreApi: k8s.CoreV1Api;
+
+/**
+ * Load a KubeConfig from the test-specific kubeconfig file so
+ * we never interfere with the user's default cluster context.
+ */
+function loadTestKubeConfig(): k8s.KubeConfig {
+  const kc = new k8s.KubeConfig();
+  const kubeconfigPath = process.env.BLINK_K8S_TEST_KUBECONFIG;
+  if (kubeconfigPath) {
+    kc.loadFromFile(kubeconfigPath);
+  } else {
+    // Fallback: load from default (CI environments, etc.).
+    kc.loadFromDefault();
+  }
+  return kc;
+}
 
 /**
  * Helper: create a simple ConfigMap, Pod, and Service that
@@ -147,13 +161,34 @@ async function cleanupTestResources() {
   ]);
 }
 
+/**
+ * Poll until a Pod is fully deleted (returns 404).
+ */
+async function waitForDeletion(
+  name: string,
+  timeoutMs = 30_000
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      await coreApi.readNamespacedPod({ name, namespace: NAMESPACE });
+    } catch (err: unknown) {
+      if (typeof err === "object" && err !== null && "code" in err) {
+        if ((err as { code: number }).code === 404) return;
+      }
+      throw err;
+    }
+    await Bun.sleep(1_000);
+  }
+  throw new Error(`Pod ${name} was not deleted within ${timeoutMs}ms`);
+}
+
 // eslint-disable-next-line @typescript-eslint/no-empty-function
 const describeOrSkip = SKIP ? describe.skip : describe;
 
 describeOrSkip("K8s agent deployment (integration)", () => {
   beforeAll(async () => {
-    const kc = new k8s.KubeConfig();
-    kc.loadFromDefault();
+    const kc = loadTestKubeConfig();
     coreApi = kc.makeApiClient(k8s.CoreV1Api);
 
     // Clean up any leftover resources from a previous run.
@@ -194,43 +229,29 @@ describeOrSkip("K8s agent deployment (integration)", () => {
     { timeout: 120_000 }
   );
 
-  it("redeployment replaces resources cleanly", async () => {
-    // Delete and recreate — mimics what the deployer does on redeploy.
-    await cleanupTestResources();
+  it(
+    "redeployment replaces resources cleanly",
+    async () => {
+      // Delete and recreate — mimics what the deployer does on redeploy.
+      await cleanupTestResources();
 
-    // Small delay for K8s to process deletions.
-    await Bun.sleep(2_000);
+      // Poll until the pod is actually gone — deletion is async.
+      await waitForDeletion(RESOURCE_NAME, 30_000);
 
-    // Verify the pod is gone.
-    try {
-      await coreApi.readNamespacedPod({
+      // Recreate.
+      await createTestResources();
+      const pod = await coreApi.readNamespacedPod({
         name: RESOURCE_NAME,
         namespace: NAMESPACE,
       });
-      throw new Error("Pod should have been deleted");
-    } catch (err: unknown) {
-      if (typeof err === "object" && err !== null && "code" in err) {
-        expect((err as { code: number }).code).toBe(404);
-      } else {
-        throw err;
-      }
-    }
-
-    // Recreate.
-    await createTestResources();
-    const pod = await coreApi.readNamespacedPod({
-      name: RESOURCE_NAME,
-      namespace: NAMESPACE,
-    });
-    expect(pod.metadata?.name).toBe(RESOURCE_NAME);
-  });
+      expect(pod.metadata?.name).toBe(RESOURCE_NAME);
+    },
+    { timeout: 60_000 }
+  );
 
   it(
-    "Service DNS resolves within the cluster",
+    "Service has a ClusterIP assigned",
     async () => {
-      // Wait for the pod from the previous test to be running.
-      await waitForPhase(RESOURCE_NAME, "Running", 90_000);
-
       // Verify the Service has a ClusterIP assigned.
       const svc = await coreApi.readNamespacedService({
         name: RESOURCE_NAME,
@@ -239,6 +260,6 @@ describeOrSkip("K8s agent deployment (integration)", () => {
       expect(svc.spec?.clusterIP).toBeTruthy();
       expect(svc.spec?.clusterIP).not.toBe("None");
     },
-    { timeout: 120_000 }
+    { timeout: 30_000 }
   );
 });

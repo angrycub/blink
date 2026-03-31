@@ -18,6 +18,13 @@ import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import * as k8s from "@kubernetes/client-node";
 
 const SKIP = process.env.BLINK_K8S_TEST !== "1";
+
+// kind clusters use a self-signed CA. Bun's fetch does not honor
+// the kubeconfig certificate-authority-data the way Node.js does,
+// so we need to disable TLS verification for local test clusters.
+if (!SKIP) {
+  process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
+}
 const NAMESPACE = "default";
 const TEST_AGENT_ID = `test-agent-${Date.now()}`;
 const RESOURCE_NAME = `blink-agent-${TEST_AGENT_ID}`;

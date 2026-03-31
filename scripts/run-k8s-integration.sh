@@ -76,6 +76,9 @@ main() {
   cd "$REPO_ROOT"
   # Ensure workspace dependencies are installed.
   bun install
+  # kind uses a self-signed CA; disable TLS verification so bun's
+  # fetch can talk to the API server.
+  export NODE_TLS_REJECT_UNAUTHORIZED=0
   # The test file uses bun:test and talks to the kind cluster
   # via the default kubeconfig.
   BLINK_K8S_TEST=1 bun test packages/server/test/k8s/integration.test.ts || {

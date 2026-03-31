@@ -26,6 +26,7 @@ K8S_DIR="$REPO_ROOT/packages/server/test/k8s"
 # Temp files — cleaned up on exit.
 KIND_KUBECONFIG="$(mktemp "${TMPDIR:-/tmp}/blink-kind-kubeconfig.XXXXXX")"
 PROXY_KUBECONFIG="$(mktemp "${TMPDIR:-/tmp}/blink-proxy-kubeconfig.XXXXXX")"
+PROXY_LOG="$(mktemp "${TMPDIR:-/tmp}/blink-kubectl-proxy.XXXXXX")"
 PROXY_PID=""
 
 # ---------------------------------------------------------------------------
@@ -80,7 +81,7 @@ delete_cluster() {
 # ---------------------------------------------------------------------------
 start_proxy() {
   echo "Starting kubectl proxy..."
-  KUBECONFIG="$KIND_KUBECONFIG" kubectl proxy --port=0 --disable-filter=true &>/tmp/blink-kubectl-proxy.log &
+  KUBECONFIG="$KIND_KUBECONFIG" kubectl proxy --port=0 --disable-filter=true >"$PROXY_LOG" 2>&1 &
   PROXY_PID=$!
 
   # Wait for the proxy to print its port.
@@ -88,13 +89,15 @@ start_proxy() {
   local proxy_port=""
   while [[ -z "$proxy_port" && $attempts -lt 30 ]]; do
     sleep 0.5
-    proxy_port=$(grep -oP 'Starting to serve on 127\.0\.0\.1:\K\d+' /tmp/blink-kubectl-proxy.log 2>/dev/null || true)
-    ((attempts++))
+    # Extract the port from "Starting to serve on 127.0.0.1:<port>".
+    # Use sed instead of grep -P for macOS compatibility.
+    proxy_port=$(sed -n 's/.*Starting to serve on 127\.0\.0\.1:\([0-9]*\).*/\1/p' "$PROXY_LOG" 2>/dev/null || true)
+    ((attempts++)) || true
   done
 
   if [[ -z "$proxy_port" ]]; then
     echo "ERROR: kubectl proxy failed to start" >&2
-    cat /tmp/blink-kubectl-proxy.log >&2
+    cat "$PROXY_LOG" >&2
     exit 1
   fi
 
@@ -132,7 +135,7 @@ stop_proxy() {
 # ---------------------------------------------------------------------------
 cleanup() {
   stop_proxy
-  rm -f "$KIND_KUBECONFIG" "$PROXY_KUBECONFIG" /tmp/blink-kubectl-proxy.log
+  rm -f "$KIND_KUBECONFIG" "$PROXY_KUBECONFIG" "$PROXY_LOG"
   if [[ "${KEEP_CLUSTER:-}" != "1" ]]; then
     delete_cluster
   fi

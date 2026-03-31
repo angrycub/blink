@@ -4,10 +4,17 @@
  * These tests require a running Kubernetes cluster (e.g. kind) and
  * are gated behind the BLINK_K8S_TEST=1 environment variable.
  *
- * Run via: ./scripts/run-k8s-integration.sh
- * Or manually: BLINK_K8S_TEST=1 bun test packages/server/test/k8s/integration.test.ts
+ * IMPORTANT: Run from the repo root so bun can resolve workspace
+ * dependencies:
+ *
+ *   ./scripts/run-k8s-integration.sh
+ *   # or
+ *   bun install && BLINK_K8S_TEST=1 bun test packages/server/test/k8s/integration.test.ts
  */
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
+
+// This import requires `bun install` at the repo root first.
+// If you see "Cannot find module", run: bun install
 import * as k8s from "@kubernetes/client-node";
 
 const SKIP = process.env.BLINK_K8S_TEST !== "1";

@@ -74,6 +74,8 @@ main() {
   echo "=== Running K8s integration tests ==="
   echo ""
   cd "$REPO_ROOT"
+  # Ensure workspace dependencies are installed.
+  bun install
   # The test file uses bun:test and talks to the kind cluster
   # via the default kubeconfig.
   BLINK_K8S_TEST=1 bun test packages/server/test/k8s/integration.test.ts || {

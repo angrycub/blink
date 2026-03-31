@@ -78,6 +78,18 @@ export const CLI_OPTION_DEFINITIONS = {
     env: "BLINK_AGENT_IMAGE",
     defaultValue: "ghcr.io/coder/blink-agent:latest",
   },
+  deployMode: {
+    flags: "--deploy-mode <mode>",
+    description: "Agent deployment backend: 'docker' or 'kubernetes'",
+    env: "BLINK_DEPLOY_MODE",
+    defaultValue: "docker",
+  },
+  k8sNamespace: {
+    flags: "--k8s-namespace <namespace>",
+    description: "Kubernetes namespace for agent deployments (only used when deploy-mode is 'kubernetes')",
+    env: "BLINK_K8S_NAMESPACE",
+    defaultValue: "default",
+  },
   devhookDisableAuth: {
     flags: "--devhook-disable-auth",
     description: "Disable authentication for devhook routes",

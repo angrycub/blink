@@ -108,6 +108,8 @@ async function runServer(options: ResolvedCliOptions) {
     accessUrl,
     wildcardAccessUrl: options.wildcardAccessUrl,
     agentImage: options.agentImage,
+    deployMode: options.deployMode,
+    k8sNamespace: options.k8sNamespace,
     devhookDisableAuth: options.devhookDisableAuth,
     enableSignups: options.enableSignups,
     enableOauth: false,

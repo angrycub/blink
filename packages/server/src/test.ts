@@ -193,6 +193,8 @@ export const serve = async (options?: ServeOptions) => {
     devProxy,
     wildcardAccessUrl,
     agentImage: CLI_OPTION_DEFINITIONS.agentImage.defaultValue,
+    deployMode: CLI_OPTION_DEFINITIONS.deployMode.defaultValue,
+    k8sNamespace: CLI_OPTION_DEFINITIONS.k8sNamespace.defaultValue,
     devhookDisableAuth: false,
     enableSignups: options?.enableSignups ?? true,
     enableOauth: options?.enableOauth ?? true,

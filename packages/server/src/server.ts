@@ -16,6 +16,7 @@ import path, { join } from "path";
 import { parse } from "url";
 import { WebSocket, WebSocketServer } from "ws";
 import { deployAgentWithDocker } from "./agent-deployment";
+import { deployAgentWithKubernetes } from "./k8s-deployment";
 import { ChatManager } from "./chat";
 import { createDevhookSupport } from "./devhook";
 
@@ -31,6 +32,8 @@ export interface ServerOptions {
   accessUrl: string;
   wildcardAccessUrl?: string;
   agentImage: string;
+  deployMode: string;
+  k8sNamespace: string;
   devhookDisableAuth: boolean;
   enableSignups: boolean;
   enableOauth: boolean;
@@ -55,6 +58,8 @@ export async function startServer(
     devProxy,
     wildcardAccessUrl,
     agentImage,
+    deployMode,
+    k8sNamespace,
     devhookDisableAuth,
     enableSignups,
     enableOauth,
@@ -269,35 +274,49 @@ export async function startServer(
       if (!db) {
         db = querier;
       }
-      await deployAgentWithDocker({
-        image: agentImage,
-        deployment,
-        querier: db,
-        baseUrl,
-        accessUrl,
-        authSecret,
-        downloadFile: async (id: string) => {
-          const file = await db.selectFileByID(id);
-          if (!file || !file.content) {
-            throw new Error("File not found");
-          }
+      const downloadFile = async (id: string) => {
+        const file = await db.selectFileByID(id);
+        if (!file || !file.content) {
+          throw new Error("File not found");
+        }
 
-          // Convert buffer back to ReadableStream
-          const stream = new ReadableStream({
-            start(controller) {
-              controller.enqueue(file.content);
-              controller.close();
-            },
-          });
+        // Convert buffer back to ReadableStream
+        const stream = new ReadableStream({
+          start(controller) {
+            controller.enqueue(file.content);
+            controller.close();
+          },
+        });
 
-          return {
-            stream,
-            type: file.content_type,
-            name: file.name,
-            size: file.byte_length,
-          };
-        },
-      });
+        return {
+          stream,
+          type: file.content_type,
+          name: file.name,
+          size: file.byte_length,
+        };
+      };
+      if (deployMode === "kubernetes") {
+        await deployAgentWithKubernetes({
+          image: agentImage,
+          deployment,
+          querier: db,
+          baseUrl,
+          accessUrl,
+          authSecret,
+          namespace: k8sNamespace,
+          downloadFile,
+        });
+      } else {
+        await deployAgentWithDocker({
+          image: agentImage,
+          deployment,
+          querier: db,
+          baseUrl,
+          accessUrl,
+          authSecret,
+          downloadFile,
+        });
+      }
     },
     files: {
       upload: async (opts) => {

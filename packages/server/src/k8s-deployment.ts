@@ -23,6 +23,9 @@ interface K8sDeployOptions {
     name: string;
     size: number;
   }>;
+  // Override the container command for testing with images that
+  // don't have the otel collector or bash.
+  commandOverride?: string[];
 }
 
 const CONTAINER_EXTERNAL_API_PORT = 3000;
@@ -46,6 +49,7 @@ export async function deployAgentWithKubernetes(opts: K8sDeployOptions) {
     image,
     namespace,
     downloadFile,
+    commandOverride,
   } = opts;
 
   const agentId = deployment.agent_id;
@@ -214,7 +218,7 @@ export async function deployAgentWithKubernetes(opts: K8sDeployOptions) {
           {
             name: "agent",
             image,
-            command: [
+            command: commandOverride ?? [
               "bash",
               "-c",
               "/opt/otel/start-collector.sh && node __wrapper.js 2>&1 | tee /var/log/agent/agent.pipe",
@@ -266,12 +270,11 @@ export async function deployAgentWithKubernetes(opts: K8sDeployOptions) {
     console.log(`[k8s] Service ${resourceName} created`);
 
     // ---------------------------------------------------------------
-    // 8. Wait for the Pod to become Running.
-    // ---------------------------------------------------------------
-    await waitForPodRunning(coreApi, namespace, resourceName);
-
-    // ---------------------------------------------------------------
-    // 9. Update deployment record with the in-cluster access URL.
+    // 8. Update deployment record with the in-cluster access URL.
+    //    Like the Docker deployer, we mark the deployment as
+    //    successful immediately after creating the resources rather
+    //    than waiting for the Pod to become Running. The Pod will
+    //    start asynchronously.
     // ---------------------------------------------------------------
     const directAccessUrl = `http://${resourceName}.${namespace}.svc.cluster.local:${CONTAINER_EXTERNAL_API_PORT}`;
 

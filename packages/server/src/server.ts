@@ -34,6 +34,9 @@ export interface ServerOptions {
   agentImage: string;
   deployMode: string;
   k8sNamespace: string;
+  // Override the container command for testing with lightweight
+  // images that lack bash or the otel collector.
+  k8sCommandOverride?: string[];
   devhookDisableAuth: boolean;
   enableSignups: boolean;
   enableOauth: boolean;
@@ -60,6 +63,7 @@ export async function startServer(
     agentImage,
     deployMode,
     k8sNamespace,
+    k8sCommandOverride,
     devhookDisableAuth,
     enableSignups,
     enableOauth,
@@ -305,6 +309,7 @@ export async function startServer(
           authSecret,
           namespace: k8sNamespace,
           downloadFile,
+          commandOverride: k8sCommandOverride,
         });
       } else {
         await deployAgentWithDocker({

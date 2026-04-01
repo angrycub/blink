@@ -19,6 +19,9 @@ export interface ServeOptions {
   setEnv?: boolean;
   enableSignups?: boolean;
   enableOauth?: boolean;
+  deployMode?: string;
+  k8sNamespace?: string;
+  k8sCommandOverride?: string[];
 }
 
 const stripTrailingSlash = (value: string): string => {
@@ -193,8 +196,9 @@ export const serve = async (options?: ServeOptions) => {
     devProxy,
     wildcardAccessUrl,
     agentImage: CLI_OPTION_DEFINITIONS.agentImage.defaultValue,
-    deployMode: CLI_OPTION_DEFINITIONS.deployMode.defaultValue,
-    k8sNamespace: CLI_OPTION_DEFINITIONS.k8sNamespace.defaultValue,
+    deployMode: options?.deployMode ?? CLI_OPTION_DEFINITIONS.deployMode.defaultValue,
+    k8sNamespace: options?.k8sNamespace ?? CLI_OPTION_DEFINITIONS.k8sNamespace.defaultValue,
+    k8sCommandOverride: options?.k8sCommandOverride,
     devhookDisableAuth: false,
     enableSignups: options?.enableSignups ?? true,
     enableOauth: options?.enableOauth ?? true,

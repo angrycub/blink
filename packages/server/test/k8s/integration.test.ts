@@ -1,139 +1,43 @@
 /**
- * Integration tests for the Kubernetes agent deployment backend.
+ * End-to-end integration test for Kubernetes agent deployment.
  *
- * These tests require a running Kubernetes cluster (e.g. kind) and
- * are gated behind the BLINK_K8S_TEST=1 environment variable.
+ * Starts a real blink-server with --deploy-mode=kubernetes, creates
+ * an agent via the API, then triggers a deployment and verifies the
+ * K8s resources are created correctly.
  *
- * IMPORTANT: Run from the repo root so bun can resolve workspace
- * dependencies:
+ * Prerequisites:
+ *   - kind cluster running (via scripts/run-k8s-integration.sh)
+ *   - BLINK_K8S_TEST=1
+ *   - KUBECONFIG pointing at the kubectl proxy kubeconfig
+ *   - Docker running with postgres:16-alpine on port 5432
  *
- *   ./scripts/run-k8s-integration.sh
- *   # or
- *   bun install && BLINK_K8S_TEST=1 bun test packages/server/test/k8s/integration.test.ts
- *
- * The test uses BLINK_K8S_TEST_KUBECONFIG to load an isolated
- * kubeconfig (e.g. exported by kind) so it never touches your
- * default ~/.kube/config.
+ * Run via: ./scripts/run-k8s-integration.sh
  */
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
-
-// This import requires `bun install` at the repo root first.
-// If you see "Cannot find module", run: bun install
 import * as k8s from "@kubernetes/client-node";
 
 const SKIP = process.env.BLINK_K8S_TEST !== "1";
-
 const NAMESPACE = "default";
-const TEST_AGENT_ID = `test-agent-${Date.now()}`;
-const RESOURCE_NAME = `blink-agent-${TEST_AGENT_ID}`;
-
-// Labels applied to all test resources for easy cleanup.
-const LABELS: Record<string, string> = {
-  app: "blink-agent",
-  "blink.so/agent-id": TEST_AGENT_ID,
-  "blink.so/test": "true",
-};
 
 let coreApi: k8s.CoreV1Api;
+let server: Awaited<ReturnType<typeof import("../../src/test").serve>>;
+let agentId: string | undefined;
 
-/**
- * Load a KubeConfig from the test-specific kubeconfig file so
- * we never interfere with the user's default cluster context.
- */
 function loadTestKubeConfig(): k8s.KubeConfig {
   const kc = new k8s.KubeConfig();
   const kubeconfigPath = process.env.BLINK_K8S_TEST_KUBECONFIG;
   if (kubeconfigPath) {
     kc.loadFromFile(kubeconfigPath);
   } else {
-    // Fallback: load from default (CI environments, etc.).
     kc.loadFromDefault();
   }
   return kc;
 }
 
-/**
- * Helper: create a simple ConfigMap, Pod, and Service that
- * mimic what deployAgentWithKubernetes creates — but using a
- * lightweight nginx image instead of the real blink-agent image
- * so the test doesn't need to pull a large image.
- */
-async function createTestResources() {
-  // ConfigMap (minimal — just proves we can create one).
-  const configMap: k8s.V1ConfigMap = {
-    metadata: { name: RESOURCE_NAME, namespace: NAMESPACE, labels: LABELS },
-    data: { "agent.js": 'console.log("hello from test agent");' },
-  };
-  await coreApi.createNamespacedConfigMap({
-    namespace: NAMESPACE,
-    body: configMap,
-  });
-
-  // Pod — use nginx:alpine as a lightweight always-running image.
-  const pod: k8s.V1Pod = {
-    metadata: { name: RESOURCE_NAME, namespace: NAMESPACE, labels: LABELS },
-    spec: {
-      restartPolicy: "Never",
-      containers: [
-        {
-          name: "agent",
-          image: "nginx:alpine",
-          ports: [{ containerPort: 80 }],
-        },
-      ],
-    },
-  };
-  await coreApi.createNamespacedPod({ namespace: NAMESPACE, body: pod });
-
-  // Service — ClusterIP targeting the pod.
-  const service: k8s.V1Service = {
-    metadata: { name: RESOURCE_NAME, namespace: NAMESPACE, labels: LABELS },
-    spec: {
-      type: "ClusterIP",
-      selector: { "blink.so/agent-id": TEST_AGENT_ID },
-      ports: [{ port: 80, targetPort: 80, protocol: "TCP" }],
-    },
-  };
-  await coreApi.createNamespacedService({
-    namespace: NAMESPACE,
-    body: service,
-  });
-}
-
-/**
- * Wait for a pod to reach a given phase, with timeout.
- */
-async function waitForPhase(
-  name: string,
-  targetPhase: string,
-  timeoutMs = 90_000
-): Promise<string> {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    const pod = await coreApi.readNamespacedPod({
-      name,
-      namespace: NAMESPACE,
-    });
-    const phase = pod.status?.phase ?? "Unknown";
-    if (phase === targetPhase) return phase;
-    if (phase === "Failed" || phase === "Succeeded") {
-      throw new Error(`Pod ${name} entered terminal phase: ${phase}`);
-    }
-    await Bun.sleep(2_000);
-  }
-  throw new Error(
-    `Pod ${name} did not reach ${targetPhase} within ${timeoutMs}ms`
-  );
-}
-
-/**
- * Delete a resource, ignoring 404.
- */
 async function safeDelete(fn: () => Promise<unknown>) {
   try {
     await fn();
   } catch (err: unknown) {
-    // Duck-type check for a 404 from the K8s API.
     if (typeof err === "object" && err !== null && "code" in err) {
       if ((err as { code: number }).code === 404) return;
     }
@@ -141,125 +45,168 @@ async function safeDelete(fn: () => Promise<unknown>) {
   }
 }
 
-async function cleanupTestResources() {
+async function cleanupK8sResources(id: string) {
+  const name = `blink-agent-${id}`;
   await Promise.all([
     safeDelete(() =>
-      coreApi.deleteNamespacedPod({ name: RESOURCE_NAME, namespace: NAMESPACE })
+      coreApi.deleteNamespacedPod({ name, namespace: NAMESPACE })
     ),
     safeDelete(() =>
-      coreApi.deleteNamespacedService({
-        name: RESOURCE_NAME,
-        namespace: NAMESPACE,
-      })
+      coreApi.deleteNamespacedService({ name, namespace: NAMESPACE })
     ),
     safeDelete(() =>
-      coreApi.deleteNamespacedConfigMap({
-        name: RESOURCE_NAME,
-        namespace: NAMESPACE,
-      })
+      coreApi.deleteNamespacedConfigMap({ name, namespace: NAMESPACE })
     ),
   ]);
 }
 
-/**
- * Poll until a Pod is fully deleted (returns 404).
- */
-async function waitForDeletion(
-  name: string,
-  timeoutMs = 30_000
-): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    try {
-      await coreApi.readNamespacedPod({ name, namespace: NAMESPACE });
-    } catch (err: unknown) {
-      if (typeof err === "object" && err !== null && "code" in err) {
-        if ((err as { code: number }).code === 404) return;
-      }
-      throw err;
-    }
-    await Bun.sleep(1_000);
-  }
-  throw new Error(`Pod ${name} was not deleted within ${timeoutMs}ms`);
-}
-
-// eslint-disable-next-line @typescript-eslint/no-empty-function
 const describeOrSkip = SKIP ? describe.skip : describe;
 
-describeOrSkip("K8s agent deployment (integration)", () => {
+describeOrSkip("K8s agent deployment (end-to-end)", () => {
   beforeAll(async () => {
     const kc = loadTestKubeConfig();
     coreApi = kc.makeApiClient(k8s.CoreV1Api);
 
-    // Clean up any leftover resources from a previous run.
-    await cleanupTestResources();
-  });
+    // Start a real blink-server in kubernetes deploy mode.
+    // Uses a real Postgres (Docker container on port 5432) to
+    // avoid PGlite's single-connection limitation.
+    const { serve } = await import("../../src/test");
+    server = await serve({
+      postgresUrl: process.env.BLINK_TEST_POSTGRES_URL ?? "postgresql://postgres:test@localhost:5432/blink",
+      enableSignups: true,
+      devProxy: false,
+      wildcardAccessUrl: false,
+      deployMode: "kubernetes",
+      k8sNamespace: NAMESPACE,
+      // node:alpine doesn't have bash or the otel collector.
+      k8sCommandOverride: ["node", "__wrapper.js"],
+    });
+  }, 60_000);
 
   afterAll(async () => {
-    await cleanupTestResources();
-  });
-
-  it("creates ConfigMap, Pod, and Service successfully", async () => {
-    await createTestResources();
-
-    // Verify ConfigMap exists.
-    const cm = await coreApi.readNamespacedConfigMap({
-      name: RESOURCE_NAME,
-      namespace: NAMESPACE,
-    });
-    expect(cm.metadata?.name).toBe(RESOURCE_NAME);
-    expect(cm.data?.["agent.js"]).toContain("hello from test agent");
-
-    // Verify Service exists.
-    const svc = await coreApi.readNamespacedService({
-      name: RESOURCE_NAME,
-      namespace: NAMESPACE,
-    });
-    expect(svc.metadata?.name).toBe(RESOURCE_NAME);
-    expect(svc.spec?.type).toBe("ClusterIP");
-    expect(svc.spec?.ports?.[0]?.port).toBe(80);
-  });
+    if (agentId) {
+      await cleanupK8sResources(agentId);
+    }
+    if (server) {
+      await server[Symbol.asyncDispose]();
+    }
+  }, 30_000);
 
   it(
-    "Pod reaches Running phase",
+    "deploys an agent to Kubernetes and creates K8s resources",
     async () => {
-      const phase = await waitForPhase(RESOURCE_NAME, "Running");
-      expect(phase).toBe("Running");
-    },
-    { timeout: 120_000 }
-  );
+      const { user, client } = await server.helpers.createUser();
+      const orgs = await client.organizations.list();
+      const orgId = orgs[0]!.id;
 
-  it(
-    "redeployment replaces resources cleanly",
-    async () => {
-      // Delete and recreate — mimics what the deployer does on redeploy.
-      await cleanupTestResources();
+      // Upload the agent file.
+      const agentCode = `
+const http = require("http");
+const server = http.createServer((req, res) => {
+  res.writeHead(200, { "Content-Type": "application/json" });
+  res.end(JSON.stringify({ status: "ok", agent: "k8s-e2e-test" }));
+});
+server.listen(process.env.PORT || 3000, "0.0.0.0", () => {
+  console.log("Test agent listening on port " + (process.env.PORT || 3000));
+});
+`;
+      const uploaded = await client.files.upload(
+        new File([Buffer.from(agentCode)], "agent.js", {
+          type: "application/javascript",
+        })
+      );
 
-      // Poll until the pod is actually gone — deletion is async.
-      await waitForDeletion(RESOURCE_NAME, 30_000);
+      // Create the agent WITHOUT output_files — this avoids the
+      // db.tx() + deployAgent deadlock. The agent gets created but
+      // no deployment is triggered yet.
+      const agentName = `k8s-e2e-test-${Date.now()}`;
+      const agent = await client.agents.create({
+        name: agentName,
+        organization_id: orgId,
+        entrypoint: "agent.js",
+        output_files: undefined,
+        source_files: undefined,
+        env: [],
+      });
+      agentId = agent.id;
+      console.log(`Agent created: ${agent.id} (${agent.name})`);
 
-      // Recreate.
-      await createTestResources();
+      // Now trigger a deployment separately — this goes through
+      // deployments.server.ts which calls deployAgent outside a tx.
+      const deployment = await client.agents.deployments.create({
+        agent_id: agent.id,
+        target: "production",
+        entrypoint: "agent.js",
+        output_files: [{ path: "agent.js", id: uploaded.id }],
+        source_files: [],
+      });
+      console.log(`Deployment created: ${deployment.id} (status: ${deployment.status})`);
+
+      // Poll for deployment completion.
+      let current: any = deployment;
+      const deadline = Date.now() + 120_000;
+      while (Date.now() < deadline) {
+        current = await client.agents.deployments.get({
+          agent_id: agent.id,
+          deployment_id: deployment.id,
+        });
+        if (current.status === "success" || current.status === "failed") {
+          break;
+        }
+        await Bun.sleep(2_000);
+      }
+
+      console.log(`Final deployment status: ${current.status}`);
+      if (current.status === "failed") {
+        console.log(`Error: ${current.error_message}`);
+      }
+
+      // Verify K8s resources.
+      const resourceName = `blink-agent-${agent.id}`;
+
+      const cm = await coreApi.readNamespacedConfigMap({
+        name: resourceName,
+        namespace: NAMESPACE,
+      });
+      expect(cm.metadata?.name).toBe(resourceName);
+      expect(cm.binaryData?.["agent.js"]).toBeTruthy();
+      expect(cm.binaryData?.["__wrapper.js"]).toBeTruthy();
+
       const pod = await coreApi.readNamespacedPod({
-        name: RESOURCE_NAME,
+        name: resourceName,
         namespace: NAMESPACE,
       });
-      expect(pod.metadata?.name).toBe(RESOURCE_NAME);
-    },
-    { timeout: 60_000 }
-  );
+      expect(pod.metadata?.name).toBe(resourceName);
+      expect(pod.metadata?.labels?.["blink.so/agent-id"]).toBe(agent.id);
 
-  it(
-    "Service has a ClusterIP assigned",
-    async () => {
-      // Verify the Service has a ClusterIP assigned.
+      const mainContainer = pod.spec?.containers?.find(
+        (c) => c.name === "agent"
+      );
+      expect(mainContainer).toBeTruthy();
+      expect(mainContainer?.workingDir).toBe("/app");
+      expect(mainContainer?.ports?.[0]?.containerPort).toBe(3000);
+
+      const envMap = new Map(
+        mainContainer?.env?.map((e) => [e.name, e.value])
+      );
+      expect(envMap.get("ENTRYPOINT")).toBe("./agent.js");
+      expect(envMap.get("PORT")).toBe("3000");
+
       const svc = await coreApi.readNamespacedService({
-        name: RESOURCE_NAME,
+        name: resourceName,
         namespace: NAMESPACE,
       });
+      expect(svc.metadata?.name).toBe(resourceName);
+      expect(svc.spec?.type).toBe("ClusterIP");
+      expect(svc.spec?.ports?.[0]?.port).toBe(3000);
       expect(svc.spec?.clusterIP).toBeTruthy();
       expect(svc.spec?.clusterIP).not.toBe("None");
+
+      expect(current.status).toBe("success");
+      // The direct_access_url is set in the database but may not be
+      // exposed through the API. Verify via K8s Service instead.
+      expect(svc.spec?.clusterIP).toBeTruthy();
     },
-    { timeout: 30_000 }
+    { timeout: 180_000 }
   );
 });

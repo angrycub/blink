@@ -131,10 +131,44 @@ stop_proxy() {
 }
 
 # ---------------------------------------------------------------------------
+# Postgres — needed because the blink server's API handler calls
+# deployAgent inside a database transaction, which deadlocks with
+# PGlite's single-connection pool. A real Postgres handles this.
+# ---------------------------------------------------------------------------
+PG_CONTAINER="blink-test-pg"
+PG_URL="postgresql://postgres:test@localhost:5432/blink"
+
+start_postgres() {
+  docker rm -f "$PG_CONTAINER" &>/dev/null || true
+  echo "Starting Postgres..."
+  docker run -d --name "$PG_CONTAINER" \
+    -e POSTGRES_PASSWORD=test \
+    -e POSTGRES_DB=blink \
+    -p 5432:5432 \
+    postgres:16-alpine >/dev/null
+  # Wait for it to be ready.
+  local attempts=0
+  while ! docker exec "$PG_CONTAINER" pg_isready -q 2>/dev/null; do
+    sleep 0.5
+    ((attempts++)) || true
+    if [[ $attempts -ge 20 ]]; then
+      echo "ERROR: Postgres failed to start" >&2
+      exit 1
+    fi
+  done
+  echo "Postgres ready"
+}
+
+stop_postgres() {
+  docker rm -f "$PG_CONTAINER" &>/dev/null || true
+}
+
+# ---------------------------------------------------------------------------
 # Cleanup.
 # ---------------------------------------------------------------------------
 cleanup() {
   stop_proxy
+  stop_postgres
   rm -f "$KIND_KUBECONFIG" "$PROXY_KUBECONFIG" "$PROXY_LOG"
   if [[ "${KEEP_CLUSTER:-}" != "1" ]]; then
     delete_cluster
@@ -153,6 +187,7 @@ main() {
   KUBECONFIG="$KIND_KUBECONFIG" kubectl apply -f "$K8S_DIR/rbac.yaml"
 
   start_proxy
+  start_postgres
 
   echo ""
   echo "=== Running K8s integration tests ==="
@@ -161,8 +196,12 @@ main() {
   bun install
 
   # The test loads the proxy kubeconfig — plain HTTP, no TLS issues.
+  # KUBECONFIG is read by @kubernetes/client-node's loadFromDefault()
+  # which is used by the deployer itself.
   BLINK_K8S_TEST=1 \
+  KUBECONFIG="$PROXY_KUBECONFIG" \
   BLINK_K8S_TEST_KUBECONFIG="$PROXY_KUBECONFIG" \
+  BLINK_TEST_POSTGRES_URL="$PG_URL" \
     bun test packages/server/test/k8s/integration.test.ts || {
     local rc=$?
     echo "Tests failed (exit code $rc)."
